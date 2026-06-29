@@ -1,0 +1,18 @@
+# Bun
+node_modules/
+bun.lockb
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+/agent
