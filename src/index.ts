@@ -1,142 +1,278 @@
 /**
- * pi-server — long-running HTTP bridge around pi-coding-agent
+ * pi-server — long-running HTTP/SSE bridge around pi-coding-agent
  *
- * One process = one AgentSession = one speaker. The speaker identity is
- * encoded in process.cwd(): pi-server reads auth.json / models.json /
- * settings.json / SYSTEM.md directly from ${cwd}/.
+ * One process hosts many pi agents. The client sends an agent id on each
+ * request; pi-server maps it to:
+ *   - ${cwd}/agents/<agent-id>/settings.json
+ *   - ${cwd}/agents/<agent-id>/SYSTEM.md
+ *   - ${cwd}/sessions/<agent-id>.jsonl
  *
- * Wire protocol: see PROTOCOL.md
+ * The agent directory is static configuration. The sessions directory is
+ * dynamic append-only history.
  */
 
+import { mkdir, stat, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
 	AuthStorage,
 	createAgentSession,
+	DefaultResourceLoader,
 	ModelRegistry,
 	SessionManager,
 	SettingsManager,
 	type AgentSession,
 	type AgentSessionEvent,
-	type ThinkingLevel,
 } from "@earendil-works/pi-coding-agent";
 
 // ============================================================================
-// Configuration (env vars + cwd-based identity)
+// Configuration
 // ============================================================================
 
 const PORT = parseInt(process.env.PI_SERVER_PORT ?? "8081", 10);
-const CWD = process.cwd();
+const ROOT_DIR = process.cwd();
+const AGENTS_DIR = join(ROOT_DIR, "agents");
+const SESSIONS_DIR = join(ROOT_DIR, "sessions");
 const ALLOW_BUILTIN_TOOLS = !!process.env.PI_ALLOW_BUILTIN_TOOLS;
 const HEARTBEAT_MS = 15_000;
 
-// SDK reads PI_CODING_AGENT_DIR to locate auth.json / models.json / settings.json
-// AND to determine where session files are stored.
-// Setting it to cwd makes per-speaker state live directly in the speaker dir:
-//   - ${cwd}/auth.json, ${cwd}/models.json, ${cwd}/settings.json
-//   - ${cwd}/SYSTEM.md (auto-discovered as agentDir-level system prompt, no project trust needed)
-//   - ${cwd}/APPEND_SYSTEM.md
-//   - ${cwd}/AGENTS.md / ${cwd}/CLAUDE.md (context files; also walked up from cwd)
-//   - ${cwd}/.pi/extensions/, ${cwd}/.pi/skills/, etc. (project-local resources)
-//   - ${cwd}/sessions/--<encoded-cwd>--/*.jsonl (session history)
-process.env.PI_CODING_AGENT_DIR = CWD;
+// Keep SDK global defaults rooted in pi-server's data root. Per-agent calls pass
+// explicit agentDir/settings/sessionManager so this is only a safe fallback.
+process.env.PI_CODING_AGENT_DIR = ROOT_DIR;
 
 const log = (msg: string): void => console.log(`[pi-server] ${msg}`);
 const errLog = (msg: string, e?: unknown): void =>
 	console.error(`[pi-server] ${msg}`, e ?? "");
 
-log(`cwd=${CWD}`);
+log(`root=${ROOT_DIR}`);
+log(`agents=${AGENTS_DIR}`);
+log(`sessions=${SESSIONS_DIR}`);
 log(
 	`builtinTools=${ALLOW_BUILTIN_TOOLS ? "on" : "off"}${
 		ALLOW_BUILTIN_TOOLS ? " (overridden by PI_ALLOW_BUILTIN_TOOLS)" : ""
 	}`,
 );
 
+await mkdir(SESSIONS_DIR, { recursive: true });
+
 // ============================================================================
-// Initialize AgentSession (fail-fast on any startup error)
+// Types
 // ============================================================================
 
-const settingsManager = SettingsManager.create(CWD);
-const authStorage = AuthStorage.create();
-const modelRegistry = ModelRegistry.create(authStorage);
+type Model = NonNullable<ReturnType<ModelRegistry["find"]>>;
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
-// settings.json is the sole source of truth for which model runs in this
-// pi-server. No fallback: missing fields, unknown model, or missing auth
-// all fail-fast with an actionable error message. The user explicitly
-// opted out of "pick any first-available" behavior.
-const settingsModel: NonNullable<ReturnType<typeof modelRegistry.find>> = (() => {
-	const provider = settingsManager.getDefaultProvider();
-	if (!provider) {
-		errLog(
-			`settings.json is missing "defaultProvider" — add it (e.g. "anthropic") to configure which model to use`,
-		);
-		process.exit(1);
-	}
-	const modelId = settingsManager.getDefaultModel();
-	if (!modelId) {
-		errLog(
-			`settings.json has "defaultProvider":"${provider}" but is missing "defaultModel" — add it (e.g. "claude-sonnet-4-5")`,
-		);
-		process.exit(1);
-	}
-	const found = modelRegistry.find(provider, modelId);
-	if (!found) {
-		errLog(
-			`settings.json requests ${provider}/${modelId} but no such model exists in the registry`,
-		);
-		process.exit(1);
-	}
-	if (!modelRegistry.hasConfiguredAuth(found)) {
-		errLog(
-			`settings.json requests ${provider}/${modelId} but auth.json has no credentials for ${provider}`,
-		);
-		process.exit(1);
-	}
-	return found;
-})();
+type SseClient = {
+	readonly id: number;
+	readonly startedAt: number;
+	responseChars: number;
+	closed: boolean;
+	enqueue(chunk: Uint8Array): void;
+	close(): void;
+};
 
-const settingsThinkingLevel: ThinkingLevel | undefined = settingsManager.getDefaultThinkingLevel();
+type AgentRuntime = {
+	readonly agentId: string;
+	readonly agentDir: string;
+	readonly sessionPath: string;
+	readonly settingsManager: SettingsManager;
+	readonly authStorage: AuthStorage;
+	readonly modelRegistry: ModelRegistry;
+	readonly session: AgentSession;
+	activeClient?: SseClient;
+	activeUnsub?: () => void;
+};
 
-let session: AgentSession;
-try {
+// ============================================================================
+// Agent loading
+// ============================================================================
+
+const agents = new Map<string, Promise<AgentRuntime>>();
+let nextClientId = 1;
+
+function isValidAgentId(agentId: string): boolean {
+	return /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(agentId);
+}
+
+function getAgentId(req: Request): string | undefined {
+	const authorization = req.headers.get("authorization");
+	if (authorization) {
+		const match = authorization.match(/^Bearer\s+(.+)$/i);
+		if (match?.[1]) return match[1].trim();
+	}
+	return req.headers.get("x-agent-id")?.trim() || undefined;
+}
+
+function unauthorized(message = "unknown agent"): Response {
+	return Response.json({ error: "unauthorized", message }, { status: 401 });
+}
+
+async function pathIsDirectory(path: string): Promise<boolean> {
+	try {
+		return (await stat(path)).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+async function pathExists(path: string): Promise<boolean> {
+	try {
+		await stat(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function ensureSessionFile(agentId: string, agentDir: string, sessionPath: string): Promise<void> {
+	if (await pathExists(sessionPath)) return;
+
+	await mkdir(dirname(sessionPath), { recursive: true });
+	const timestamp = new Date().toISOString();
+	const header = {
+		type: "session",
+		version: 3,
+		id: agentId,
+		timestamp,
+		cwd: agentDir,
+	};
+	await writeFile(sessionPath, `${JSON.stringify(header)}\n`, { flag: "wx" });
+}
+
+async function getAgent(agentId: string): Promise<AgentRuntime | undefined> {
+	if (!isValidAgentId(agentId)) return undefined;
+
+	const agentDir = join(AGENTS_DIR, agentId);
+	if (!(await pathIsDirectory(agentDir))) return undefined;
+
+	let runtime = agents.get(agentId);
+	if (!runtime) {
+		runtime = createRuntime(agentId, agentDir).catch((e: unknown) => {
+			agents.delete(agentId);
+			throw e;
+		});
+		agents.set(agentId, runtime);
+	}
+	return runtime;
+}
+
+async function createRuntime(agentId: string, agentDir: string): Promise<AgentRuntime> {
+	const sessionPath = join(SESSIONS_DIR, `${agentId}.jsonl`);
+	await ensureSessionFile(agentId, agentDir, sessionPath);
+
+	const settingsManager = SettingsManager.create(agentDir, agentDir, {
+		projectTrusted: false,
+	});
+	assertSettingsReadable(agentId, settingsManager);
+
+	const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
+	const modelRegistry = ModelRegistry.create(authStorage, join(agentDir, "models.json"));
+	const model = resolveSettingsModel(agentId, settingsManager, modelRegistry);
+	const thinkingLevel = settingsManager.getDefaultThinkingLevel();
+
+	const resourceLoader = new DefaultResourceLoader({
+		cwd: agentDir,
+		agentDir,
+		settingsManager,
+	});
+	await resourceLoader.reload();
+
 	const result = await createAgentSession({
-		// Disable built-in tools (read/bash/edit/write) by default.
-		// Skills, extensions, prompt templates, AGENTS.md discovery all remain enabled —
-		// they're driven by files in ${cwd}/, so empty dir = nothing loaded.
+		cwd: agentDir,
+		agentDir,
 		noTools: ALLOW_BUILTIN_TOOLS ? undefined : "builtin",
-
-		// cwd-based session persistence: most recent ${cwd}/sessions/--<encoded-cwd>--/*.jsonl
-		// is auto-resumed; no existing file → fresh session with a new id.
-		// Note: SessionManager.create() unconditionally opens a new file — use
-		// continueRecent() for resume-on-restart semantics.
-		sessionManager: SessionManager.continueRecent(CWD),
-
-		// Share these so we don't construct a second SettingsManager / ModelRegistry
-		// under the hood. modelRegistry is needed for API key resolution; without
-		// it the SDK would build its own from a different AuthStorage instance.
+		sessionManager: SessionManager.open(sessionPath, SESSIONS_DIR, agentDir),
 		settingsManager,
 		modelRegistry,
 		authStorage,
-
-		// Force settings.json's defaultProvider/defaultModel to win over the
-		// jsonl's `model_change` entry.
-		// Cast: modelRegistry.find() returns Model<Api>, createAgentSession
-		// expects Model<any> (variance gap in Model's conditional `compat` field).
-		model: settingsModel as never,
-
-		// Force settings.json's defaultThinkingLevel to win over any
-		// thinking_level_change entry recorded in the resumed jsonl.
-		thinkingLevel: settingsThinkingLevel,
+		resourceLoader,
+		model: model as never,
+		thinkingLevel,
 	});
-	session = result.session;
-} catch (e) {
-	errLog("failed to initialize AgentSession", e);
-	process.exit(1);
+
+	const runtime: AgentRuntime = {
+		agentId,
+		agentDir,
+		sessionPath,
+		settingsManager,
+		authStorage,
+		modelRegistry,
+		session: result.session,
+	};
+
+	log(
+		`agent loaded id=${agentId} messages=${runtime.session.state.messages.length}` +
+			` model=${runtime.session.model?.provider ?? "?"}/${runtime.session.model?.id ?? "?"}` +
+			` thinking=${runtime.session.thinkingLevel}` +
+			` file=${sessionPath}`,
+	);
+
+	return runtime;
 }
 
-log(
-	`session loaded id=${session.sessionId} messages=${session.state.messages.length}` +
-		` model=${session.model?.provider ?? "?"}/${session.model?.id ?? "?"}` +
-		` thinking=${session.thinkingLevel} (source: ${settingsThinkingLevel ? "settings.json" : "sdk default"})`,
-);
+function assertSettingsReadable(agentId: string, settingsManager: SettingsManager): void {
+	const errors = settingsManager.drainErrors();
+	if (errors.length === 0) return;
+	const detail = errors.map(({ scope, error }) => `${scope}: ${error.message}`).join("; ");
+	throw new Error(`agent ${agentId} settings.json failed to load: ${detail}`);
+}
+
+function resolveSettingsModel(
+	agentId: string,
+	settingsManager: SettingsManager,
+	modelRegistry: ModelRegistry,
+): Model {
+	const provider = settingsManager.getDefaultProvider();
+	if (!provider) {
+		throw new Error(
+			`agent ${agentId} settings.json is missing "defaultProvider"`,
+		);
+	}
+
+	const modelId = settingsManager.getDefaultModel();
+	if (!modelId) {
+		throw new Error(
+			`agent ${agentId} settings.json has "defaultProvider":"${provider}" but is missing "defaultModel"`,
+		);
+	}
+
+	const model = modelRegistry.find(provider, modelId);
+	if (!model) {
+		throw new Error(
+			`agent ${agentId} settings.json requests ${provider}/${modelId} but no such model exists`,
+		);
+	}
+
+	if (!modelRegistry.hasConfiguredAuth(model)) {
+		throw new Error(
+			`agent ${agentId} settings.json requests ${provider}/${modelId} but auth.json has no credentials for ${provider}`,
+		);
+	}
+
+	return model;
+}
+
+async function applySettings(runtime: AgentRuntime): Promise<void> {
+	await runtime.session.reload();
+	assertSettingsReadable(runtime.agentId, runtime.settingsManager);
+
+	const model = resolveSettingsModel(
+		runtime.agentId,
+		runtime.settingsManager,
+		runtime.modelRegistry,
+	);
+	if (
+		!runtime.session.model ||
+		runtime.session.model.provider !== model.provider ||
+		runtime.session.model.id !== model.id
+	) {
+		await runtime.session.setModel(model as never);
+	}
+
+	const thinkingLevel = runtime.settingsManager.getDefaultThinkingLevel();
+	if (thinkingLevel && runtime.session.thinkingLevel !== thinkingLevel) {
+		runtime.session.setThinkingLevel(thinkingLevel as ThinkingLevel);
+	}
+}
 
 // ============================================================================
 // SSE helpers
@@ -146,6 +282,37 @@ const enc = new TextEncoder();
 const sse = (event: string, data: unknown): Uint8Array =>
 	enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 const heartbeat = (): Uint8Array => enc.encode(":heartbeat\n\n");
+
+function makeClient(controller: ReadableStreamDefaultController<Uint8Array>): SseClient {
+	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	const client: SseClient = {
+		id: nextClientId++,
+		startedAt: Date.now(),
+		responseChars: 0,
+		closed: false,
+		enqueue(chunk): void {
+			if (client.closed) return;
+			try {
+				controller.enqueue(chunk);
+			} catch {
+				client.closed = true;
+				if (heartbeatTimer) clearInterval(heartbeatTimer);
+			}
+		},
+		close(): void {
+			if (client.closed) return;
+			client.closed = true;
+			if (heartbeatTimer) clearInterval(heartbeatTimer);
+			try {
+				controller.close();
+			} catch {
+				/* already closed */
+			}
+		},
+	};
+	heartbeatTimer = setInterval(() => client.enqueue(heartbeat()), HEARTBEAT_MS);
+	return client;
+}
 
 // ============================================================================
 // HTTP server
@@ -158,30 +325,42 @@ const server = Bun.serve({
 	async fetch(req): Promise<Response> {
 		const url = new URL(req.url);
 
-		// GET /health
 		if (req.method === "GET" && url.pathname === "/health") {
 			return Response.json({
 				status: "ok",
-				cwd: CWD,
-				sessionId: session.sessionId,
-				messageCount: session.state.messages.length,
-				model: session.model
-					? `${session.model.provider}/${session.model.id}`
-					: null,
-				thinkingLevel: session.thinkingLevel,
-				isStreaming: session.isStreaming,
+				root: ROOT_DIR,
+				agentsDir: AGENTS_DIR,
+				sessionsDir: SESSIONS_DIR,
+				loadedAgents: agents.size,
 			});
 		}
 
-		// POST /chat
+		const agentId = getAgentId(req);
+		if (!agentId) return unauthorized("missing agent id");
+
+		const runtime = await getAgent(agentId).catch((e: unknown) => {
+			errLog(`failed to load agent ${agentId}`, e);
+			return undefined;
+		});
+		if (!runtime) return unauthorized("unknown agent");
+
+		if (req.method === "GET" && url.pathname === "/agent") {
+			return Response.json({
+				agentId,
+				agentDir: runtime.agentDir,
+				sessionPath: runtime.sessionPath,
+				sessionId: runtime.session.sessionId,
+				messageCount: runtime.session.state.messages.length,
+				model: runtime.session.model
+					? `${runtime.session.model.provider}/${runtime.session.model.id}`
+					: null,
+				thinkingLevel: runtime.session.thinkingLevel,
+				isStreaming: runtime.session.isStreaming,
+			});
+		}
+
 		if (req.method === "POST" && url.pathname === "/chat") {
-			if (session.isStreaming) {
-				return Response.json(
-					{ error: "busy", state: "busy" },
-					{ status: 503, headers: { "Retry-After": "1" } },
-				);
-			}
-			return handleChat(req);
+			return handleChat(req, runtime);
 		}
 
 		return Response.json({ error: "not found" }, { status: 404 });
@@ -191,156 +370,48 @@ const server = Bun.serve({
 log(`listening on http://0.0.0.0:${server.port}`);
 
 // ============================================================================
-// /chat — streaming SSE handler with req-close abort detection
+// /chat — streaming SSE handler
 // ============================================================================
 
-function handleChat(req: Request): Response {
-	const startedAt = Date.now();
-	let responseChars = 0;
-	const stream = new ReadableStream({
+function handleChat(req: Request, runtime: AgentRuntime): Response {
+	let client: SseClient | undefined;
+	let prompt = "";
+
+	const stream = new ReadableStream<Uint8Array>({
 		async start(controller): Promise<void> {
-			let aborted = false;
-			let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+			client = makeClient(controller);
 
-			const stopHeartbeat = (): void => {
-				if (heartbeatTimer) {
-					clearInterval(heartbeatTimer);
-					heartbeatTimer = undefined;
-				}
-			};
-
-			const safeEnqueue = (chunk: Uint8Array): void => {
-				if (aborted) return;
-				try {
-					controller.enqueue(chunk);
-				} catch {
-					aborted = true;
-				}
-			};
-
-			const safeClose = (): void => {
-				if (aborted) return;
-				aborted = true;
-				stopHeartbeat();
-				try {
-					controller.close();
-				} catch {
-					/* already closed */
-				}
-			};
-
-			// ---- Parse request body ------------------------------------------
-			let prompt: string;
 			try {
 				const body = (await req.json()) as { prompt?: unknown };
 				if (typeof body?.prompt !== "string" || body.prompt.length === 0) {
-					safeEnqueue(sse("error", { message: "missing or empty 'prompt' field" }));
-					safeClose();
+					client.enqueue(sse("error", { message: "missing or empty 'prompt' field" }));
+					client.close();
 					return;
 				}
 				prompt = body.prompt;
 			} catch {
-				safeEnqueue(sse("error", { message: "invalid JSON body" }));
-				safeClose();
+				client.enqueue(sse("error", { message: "invalid JSON body" }));
+				client.close();
 				return;
 			}
 
-			// ---- Log request --------------------------------------------------
-			// Session-level info (model, thinking, sessionId, messageCount) is
-			// already logged at startup. Per-request we just print the query.
-			const promptPreview =
-				prompt.length > 200 ? `${prompt.slice(0, 200)}…(${prompt.length} chars)` : prompt;
-			log(`→ /chat prompt=${JSON.stringify(promptPreview)}`);
-
-			// ---- Heartbeat (keep proxies from timing out during silence) ------
-			heartbeatTimer = setInterval(() => safeEnqueue(heartbeat()), HEARTBEAT_MS);
-
-			// ---- Subscribe BEFORE prompt to avoid missing the first event -----
-			const unsub = session.subscribe((event: AgentSessionEvent): void => {
-				switch (event.type) {
-					case "message_update": {
-						const sub = event.assistantMessageEvent;
-						switch (sub.type) {
-							case "text_delta":
-								responseChars += sub.delta.length;
-								safeEnqueue(sse("text_delta", { delta: sub.delta }));
-								break;
-							case "thinking_start":
-								safeEnqueue(
-									sse("thinking_start", { contentIndex: sub.contentIndex }),
-								);
-								break;
-							case "thinking_delta":
-								safeEnqueue(
-									sse("thinking_delta", {
-										delta: sub.delta,
-										contentIndex: sub.contentIndex,
-									}),
-								);
-								break;
-							case "thinking_end":
-								safeEnqueue(
-									sse("thinking_end", {
-										content: sub.content,
-										contentIndex: sub.contentIndex,
-									}),
-								);
-								break;
-							// Drop text_start, text_end, toolcall_*, done, error
-						}
-						break;
-					}
-					case "agent_end":
-						// willRetry=true → SDK will auto-continue; keep stream open.
-						// willRetry=false → prompt finished; close stream.
-						if (!event.willRetry) {
-							safeEnqueue(sse("agent_end", {}));
-							log(
-								`← /chat ok ${Date.now() - startedAt}ms ${responseChars} chars`,
-							);
-							unsub();
-							safeClose();
-						}
-						break;
-					case "auto_retry_end":
-						if (!event.success) {
-							const reason = event.finalError ?? "auto-retry exhausted";
-							safeEnqueue(sse("error", { message: reason }));
-							log(
-								`← /chat failed ${Date.now() - startedAt}ms ${responseChars} chars: ${reason}`,
-							);
-							unsub();
-							safeClose();
-						}
-						break;
-					case "auto_retry_start":
-						// Informational: SDK is about to retry the LLM call.
-						// No SSE event emitted (client sees silence until next text_delta).
-						log(
-							`↻ /chat auto-retry ${event.attempt}/${event.maxAttempts} in ${event.delayMs}ms: ${event.errorMessage}`,
-						);
-						break;
-					// Drop everything else: queue_update, compaction_*, session_info_changed…
-				}
-			});
-
-			// ---- Send prompt (don't await — events signal completion) --------
-			session.prompt(prompt).catch((e: unknown) => {
-				// Preflight error (no model selected, no API key, etc.).
-				// Streaming errors come via the 'error' SSE event above, not here.
-				const reason = e instanceof Error ? e.message : String(e);
-				safeEnqueue(sse("error", { message: reason }));
-				log(`← /chat rejected ${Date.now() - startedAt}ms: ${reason}`);
-				unsub();
-				safeClose();
-			});
+			void beginTurn(runtime, prompt, client);
 		},
 
 		cancel(): void {
-			// Client closed the response body → abort the prompt.
-			// This is the req-close-as-abort contract documented in PROTOCOL.md §3.1.
-			log(`← /chat aborted ${Date.now() - startedAt}ms (client disconnected)`);
-			session.abort().catch((e: unknown) => errLog("session.abort error", e));
+			if (!client || client.closed) return;
+			client.closed = true;
+			log(
+				`← /chat agent=${runtime.agentId} aborted ${Date.now() - client.startedAt}ms (client disconnected)`,
+			);
+			if (runtime.activeClient === client) {
+				runtime.activeUnsub?.();
+				runtime.activeUnsub = undefined;
+				runtime.activeClient = undefined;
+				runtime.session.abort().catch((e: unknown) =>
+					errLog(`agent ${runtime.agentId} abort error`, e),
+				);
+			}
 		},
 	});
 
@@ -353,34 +424,159 @@ function handleChat(req: Request): Response {
 	});
 }
 
+function beginTurn(runtime: AgentRuntime, prompt: string, client: SseClient): void {
+	void runTurn(runtime, prompt, client).catch((e: unknown) => {
+		const reason = e instanceof Error ? e.message : String(e);
+		if (!client.closed) client.enqueue(sse("error", { message: reason }));
+		log(
+			`← /chat agent=${runtime.agentId} rejected ${Date.now() - client.startedAt}ms: ${reason}`,
+		);
+		if (runtime.activeClient === client) {
+			runtime.activeUnsub?.();
+			runtime.activeUnsub = undefined;
+			runtime.activeClient = undefined;
+		}
+		client.close();
+	});
+}
+
+async function runTurn(runtime: AgentRuntime, prompt: string, client: SseClient): Promise<void> {
+	const promptPreview =
+		prompt.length > 200 ? `${prompt.slice(0, 200)}…(${prompt.length} chars)` : prompt;
+	log(`→ /chat agent=${runtime.agentId} prompt=${JSON.stringify(promptPreview)}`);
+
+	const previousClient = runtime.activeClient;
+	if (previousClient && previousClient !== client && !previousClient.closed) {
+		previousClient.enqueue(sse("error", { message: "superseded by newer request" }));
+		previousClient.close();
+	}
+	runtime.activeUnsub?.();
+	runtime.activeUnsub = undefined;
+	runtime.activeClient = client;
+
+	if (runtime.session.isStreaming) {
+		await runtime.session.abort();
+	}
+
+	if (client.closed || runtime.activeClient !== client) return;
+	await applySettings(runtime);
+
+	if (client.closed || runtime.activeClient !== client) return;
+
+	const unsub = runtime.session.subscribe((event: AgentSessionEvent): void => {
+		if (client.closed || runtime.activeClient !== client) return;
+		handleSessionEvent(runtime, client, event, unsub);
+	});
+	runtime.activeUnsub = unsub;
+
+	await runtime.session.prompt(prompt);
+}
+
+function handleSessionEvent(
+	runtime: AgentRuntime,
+	client: SseClient,
+	event: AgentSessionEvent,
+	unsub: () => void,
+): void {
+	switch (event.type) {
+		case "message_update": {
+			const sub = event.assistantMessageEvent;
+			switch (sub.type) {
+				case "text_delta":
+					client.responseChars += sub.delta.length;
+					client.enqueue(sse("text_delta", { delta: sub.delta }));
+					break;
+				case "thinking_start":
+					client.enqueue(sse("thinking_start", { contentIndex: sub.contentIndex }));
+					break;
+				case "thinking_delta":
+					client.enqueue(
+						sse("thinking_delta", {
+							delta: sub.delta,
+							contentIndex: sub.contentIndex,
+						}),
+					);
+					break;
+				case "thinking_end":
+					client.enqueue(
+						sse("thinking_end", {
+							content: sub.content,
+							contentIndex: sub.contentIndex,
+						}),
+					);
+					break;
+			}
+			break;
+		}
+		case "agent_end":
+			if (!event.willRetry) {
+				client.enqueue(sse("agent_end", {}));
+				log(
+					`← /chat agent=${runtime.agentId} ok ${Date.now() - client.startedAt}ms ${client.responseChars} chars`,
+				);
+				unsub();
+				if (runtime.activeClient === client) {
+					runtime.activeUnsub = undefined;
+					runtime.activeClient = undefined;
+				}
+				client.close();
+			}
+			break;
+		case "auto_retry_end":
+			if (!event.success) {
+				const reason = event.finalError ?? "auto-retry exhausted";
+				client.enqueue(sse("error", { message: reason }));
+				log(
+					`← /chat agent=${runtime.agentId} failed ${Date.now() - client.startedAt}ms ${client.responseChars} chars: ${reason}`,
+				);
+				unsub();
+				if (runtime.activeClient === client) {
+					runtime.activeUnsub = undefined;
+					runtime.activeClient = undefined;
+				}
+				client.close();
+			}
+			break;
+		case "auto_retry_start":
+			log(
+				`↻ /chat agent=${runtime.agentId} auto-retry ${event.attempt}/${event.maxAttempts} in ${event.delayMs}ms: ${event.errorMessage}`,
+			);
+			break;
+	}
+}
+
 // ============================================================================
 // Graceful shutdown
 // ============================================================================
 
 let shuttingDown = false;
-function shutdown(signal: string): void {
+async function shutdown(signal: string): Promise<void> {
 	if (shuttingDown) return;
 	shuttingDown = true;
 	log(`${signal} received, shutting down`);
 
 	server.stop();
 
-	if (session.isStreaming) {
-		log("aborting in-flight prompt");
-		session.abort().catch((e: unknown) => errLog("abort error", e));
+	const runtimes = await Promise.allSettled([...agents.values()]);
+	for (const result of runtimes) {
+		if (result.status !== "fulfilled") continue;
+		const runtime = result.value;
+		if (runtime.session.isStreaming) {
+			log(`aborting in-flight prompt agent=${runtime.agentId}`);
+			await runtime.session.abort().catch((e: unknown) =>
+				errLog(`agent ${runtime.agentId} abort error`, e),
+			);
+		}
+		try {
+			runtime.session.dispose();
+			log(`agent disposed id=${runtime.agentId}`);
+		} catch (e) {
+			errLog(`agent ${runtime.agentId} dispose error`, e);
+		}
 	}
 
-	// session.dispose() is sync — flushes pending writes, removes listeners.
-	try {
-		session.dispose();
-		log("session disposed");
-	} catch (e) {
-		errLog("dispose error", e);
-	}
-
-	// Give the abort + dispose time to flush, then exit.
 	setTimeout(() => process.exit(0), 500);
 }
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
