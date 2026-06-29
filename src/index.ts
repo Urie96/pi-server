@@ -12,7 +12,9 @@
  */
 
 import { mkdir, stat, writeFile } from "node:fs/promises";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
+import { Readable } from "node:stream";
 import {
 	AuthStorage,
 	createAgentSession,
@@ -318,56 +320,115 @@ function makeClient(controller: ReadableStreamDefaultController<Uint8Array>): Ss
 // HTTP server
 // ============================================================================
 
-const server = Bun.serve({
-	port: PORT,
-	hostname: "0.0.0.0",
-
-	async fetch(req): Promise<Response> {
-		const url = new URL(req.url);
-
-		if (req.method === "GET" && url.pathname === "/health") {
-			return Response.json({
-				status: "ok",
-				root: ROOT_DIR,
-				agentsDir: AGENTS_DIR,
-				sessionsDir: SESSIONS_DIR,
-				loadedAgents: agents.size,
-			});
-		}
-
-		const agentId = getAgentId(req);
-		if (!agentId) return unauthorized("missing agent id");
-
-		const runtime = await getAgent(agentId).catch((e: unknown) => {
-			errLog(`failed to load agent ${agentId}`, e);
-			return undefined;
-		});
-		if (!runtime) return unauthorized("unknown agent");
-
-		if (req.method === "GET" && url.pathname === "/agent") {
-			return Response.json({
-				agentId,
-				agentDir: runtime.agentDir,
-				sessionPath: runtime.sessionPath,
-				sessionId: runtime.session.sessionId,
-				messageCount: runtime.session.state.messages.length,
-				model: runtime.session.model
-					? `${runtime.session.model.provider}/${runtime.session.model.id}`
-					: null,
-				thinkingLevel: runtime.session.thinkingLevel,
-				isStreaming: runtime.session.isStreaming,
-			});
-		}
-
-		if (req.method === "POST" && url.pathname === "/chat") {
-			return handleChat(req, runtime);
-		}
-
-		return Response.json({ error: "not found" }, { status: 404 });
-	},
+const server = createServer((nodeReq, nodeRes) => {
+	void handleNodeRequest(nodeReq, nodeRes);
 });
 
-log(`listening on http://0.0.0.0:${server.port}`);
+server.listen(PORT, "0.0.0.0", () => {
+	const address = server.address();
+	const port = typeof address === "object" && address ? address.port : PORT;
+	log(`listening on http://0.0.0.0:${port}`);
+});
+
+async function handleNodeRequest(
+	nodeReq: IncomingMessage,
+	nodeRes: ServerResponse,
+): Promise<void> {
+	try {
+		const req = toWebRequest(nodeReq);
+		const response = await handleRequest(req);
+		sendWebResponse(response, nodeRes);
+	} catch (e) {
+		errLog("request failed", e);
+		if (!nodeRes.headersSent) {
+			nodeRes.writeHead(500, { "Content-Type": "application/json" });
+		}
+		nodeRes.end(JSON.stringify({ error: "internal server error" }));
+	}
+}
+
+function toWebRequest(nodeReq: IncomingMessage): Request {
+	const headers = new Headers();
+	for (const [key, value] of Object.entries(nodeReq.headers)) {
+		if (Array.isArray(value)) {
+			for (const item of value) headers.append(key, item);
+		} else if (value !== undefined) {
+			headers.set(key, value);
+		}
+	}
+
+	const host = headers.get("host") ?? `127.0.0.1:${PORT}`;
+	const url = new URL(nodeReq.url ?? "/", `http://${host}`);
+	const method = nodeReq.method ?? "GET";
+	const init: RequestInit & { duplex?: "half" } = { method, headers };
+	if (method !== "GET" && method !== "HEAD") {
+		init.body = Readable.toWeb(nodeReq) as unknown as BodyInit;
+		init.duplex = "half";
+	}
+
+	return new Request(url, init);
+}
+
+function sendWebResponse(response: Response, nodeRes: ServerResponse): void {
+	nodeRes.statusCode = response.status;
+	response.headers.forEach((value, key) => nodeRes.setHeader(key, value));
+
+	if (!response.body) {
+		nodeRes.end();
+		return;
+	}
+
+	const body = Readable.fromWeb(response.body as never);
+	body.on("error", (e: unknown) => {
+		errLog("response stream failed", e);
+		nodeRes.destroy(e instanceof Error ? e : undefined);
+	});
+	body.pipe(nodeRes);
+}
+
+async function handleRequest(req: Request): Promise<Response> {
+	const url = new URL(req.url);
+
+	if (req.method === "GET" && url.pathname === "/health") {
+		return Response.json({
+			status: "ok",
+			root: ROOT_DIR,
+			agentsDir: AGENTS_DIR,
+			sessionsDir: SESSIONS_DIR,
+			loadedAgents: agents.size,
+		});
+	}
+
+	const agentId = getAgentId(req);
+	if (!agentId) return unauthorized("missing agent id");
+
+	const runtime = await getAgent(agentId).catch((e: unknown) => {
+		errLog(`failed to load agent ${agentId}`, e);
+		return undefined;
+	});
+	if (!runtime) return unauthorized("unknown agent");
+
+	if (req.method === "GET" && url.pathname === "/agent") {
+		return Response.json({
+			agentId,
+			agentDir: runtime.agentDir,
+			sessionPath: runtime.sessionPath,
+			sessionId: runtime.session.sessionId,
+			messageCount: runtime.session.state.messages.length,
+			model: runtime.session.model
+				? `${runtime.session.model.provider}/${runtime.session.model.id}`
+				: null,
+			thinkingLevel: runtime.session.thinkingLevel,
+			isStreaming: runtime.session.isStreaming,
+		});
+	}
+
+	if (req.method === "POST" && url.pathname === "/chat") {
+		return handleChat(req, runtime);
+	}
+
+	return Response.json({ error: "not found" }, { status: 404 });
+}
 
 // ============================================================================
 // /chat — streaming SSE handler
@@ -555,7 +616,7 @@ async function shutdown(signal: string): Promise<void> {
 	shuttingDown = true;
 	log(`${signal} received, shutting down`);
 
-	server.stop();
+	server.close();
 
 	const runtimes = await Promise.allSettled([...agents.values()]);
 	for (const result of runtimes) {

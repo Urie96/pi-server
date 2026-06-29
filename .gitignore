@@ -1,6 +1,9 @@
-# Bun
+# Dependencies
 node_modules/
-bun.lockb
+
+# Build output
+dist/
+result
 
 # Logs
 *.log
