@@ -191,6 +191,19 @@ async function createRuntime(agentId: string, agentDir: string): Promise<AgentRu
 		thinkingLevel,
 	});
 
+	// 打印扩展加载错误（如果扩展工厂抛错，错误被吞在这里）
+	const extErrors = resourceLoader.getExtensions().errors;
+	for (const { path, error } of extErrors) {
+		errLog(`extension error [${agentId}] ${path}: ${error}`);
+	}
+
+	// 触发 bindExtensions 以发射 session_start / resources_discover 等事件
+	// 这样才能让 pi.on("session_start", ...) 等扩展事件处理函数执行
+	await result.session.bindExtensions({
+		mode: "rpc",
+		onError: (err) => errLog(`extension runtime error [${agentId}]`, err),
+	});
+
 	const runtime: AgentRuntime = {
 		agentId,
 		agentDir,
